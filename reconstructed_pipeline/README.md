@@ -2,7 +2,385 @@
 
 This version updates the existing pipeline in response to the supervisor's 09/22 feedback. The primary biological unit is an observed fragment population with supported paired endpoints, across RNA categories. Exact-match rRNA assembly is no longer the gatekeeper for discovery. A merged reference interval remains a coverage summary, not evidence of one long RNA molecule.
 
-The three maintained deliverables are `csrna_pipeline.py`, `csrna_pipeline.ipynb`, and `README.md`. The notebook embeds the complete standalone script in ordered cells tagged `pipeline-source`. This document contains exactly the notebook's Markdown annotations. No helper modules or additional permanent analysis artifacts are required.
+The three maintained deliverables are `csrna_pipeline.py`, `csrna_pipeline.ipynb`, and `README.md`. The notebook embeds the complete standalone script in ordered cells tagged `pipeline-source`. This document contains exactly the notebook's Markdown annotations. The core pipeline remains a standalone script. The optional RBC post-analysis companion described below adds its own diagnostic outputs.
+
+## Resumable counting and alignment-capacity workflow — 2026-10-13
+
+For the large paired batch, use **persistent counting before full alignment**. Version 2.2.0 adds `--count-cache DIRECTORY` to the main standalone script. It validates R1/R2 together and counts R1 into SQLite, committing counts, positional quality sums (when enabled), and input offsets atomically. Counting has no distinct-sequence cap. Existing memory guards apply only when loading completed counts into the downstream in-memory feature engine. Completed samples are reused; an interrupted sample resumes from the last committed batch. At most the uncommitted batch is recounted.
+
+This currently supports **full-library paired manifests only** (`--pilot-pairs 0 --input-scope full_library`). Legacy single-end, FASTA/CSV, and uniform-pilot workflows remain unchanged. No mate merging, sampling, abundance filtering, or change to feature definitions is introduced by counting. The core script remains standalone and needs no Python package beyond the standard library for SQLite.
+
+### A. Count and validate once
+
+On the server, activate the environment and set paths as in the walkthrough below. Choose an empty dedicated cache directory on persistent storage with sufficient free space (not temporary job storage). Use the same directory on subsequent invocations.
+
+```bash
+CSRNA_CODE="$HOME/reconstructed_pipeline"
+CSRNA_DATA="$HOME/sequencing_data"
+CSRNA_MANIFEST="$CSRNA_DATA/samples_recent_batch.updated.csv"
+CSRNA_REFERENCE="$CSRNA_CODE/references/mouse_combined_with_rRNA_clean_dedup.fa"
+CSRNA_CACHE="$CSRNA_DATA/count_cache/full_batch"
+mkdir -p "$CSRNA_DATA/results"
+
+/usr/bin/time -v python "$CSRNA_CODE/csrna_pipeline.py" \
+  --manifest "$CSRNA_MANIFEST" --pair-handling r1-only \
+  --analysis-mode exploratory --input-scope full_library --pilot-pairs 0 \
+  --reference "$CSRNA_REFERENCE" \
+  --count-cache "$CSRNA_CACHE" --count-only \
+  --quality-detail counts-only \
+  --output "$CSRNA_DATA/results/counting_complete.json" \
+  > "$CSRNA_DATA/results/counting.stdout.log" \
+  2> "$CSRNA_DATA/results/counting.log"
+echo "Exit code: $?"
+```
+
+Adjust the manifest filename if your working file has another name. `counts-only` validates FASTQ quality syntax but omits positional quality arrays. Choose `--quality-detail positional` here if those arrays are required later; all cache-reusing commands must keep the same quality policy. Changing it requires a new cache and recount. Count-only mode does not require Bowtie2/RNAfold, although the reference path is still required and hashed for provenance.
+
+Repeat the command after an interruption. A hard kill may leave `.count.lock`: verify the previous process has stopped before removing that one stale lock. Do not delete `counts.sqlite`, `counts.sqlite-wal`, or other cache data to resolve a downstream failure. SQLite recovers committed transactions; storage failure or corruption is not automatically repaired. Do not run concurrent writers against one cache.
+
+Every invocation verifies source SHA256 hashes; retries still read the compressed input bytes. Completed libraries skip decompression/FASTQ validation/counting. Resuming partway through `.gz` may decompress the earlier portion to seek to the stored offset; ordinary gzip cannot guarantee constant-time random access. Final report publication rechecks input hashes. Inputs, sample identities, paths, counting format/Python version, and quality policy must match; otherwise use a new cache. Annotation-only manifest changes may reuse counts. The checkpoint batch defaults to 10,000 pairs; `--count-checkpoint-records` changes checkpoint frequency, not results.
+
+The count-stage JSON lists complete per-sample read/distinct totals and the union distinct count. It is **not a biological analysis report** and cannot be used by the dashboard or RBC extension.
+
+### B. Test alignment capacity using the saved counts
+
+After counting succeeds, align a reproducible uniform sample of distinct R1 sequences against the requested reference, with the same all-best-hit mapping policy as the main analysis:
+
+```bash
+/usr/bin/time -v python "$CSRNA_CODE/csrna_pipeline.py" \
+  --manifest "$CSRNA_MANIFEST" --pair-handling r1-only \
+  --analysis-mode exploratory --input-scope full_library --pilot-pairs 0 \
+  --reference "$CSRNA_REFERENCE" \
+  --count-cache "$CSRNA_CACHE" --quality-detail counts-only \
+  --alignment-capacity-queries 10000 --sampling-seed 20261007 --threads 4 \
+  --output "$CSRNA_DATA/results/alignment_capacity_10000.json" \
+  > "$CSRNA_DATA/results/alignment_capacity_10000.stdout.log" \
+  2> "$CSRNA_DATA/results/alignment_capacity_10000.log"
+echo "Exit code: $?"
+```
+
+Inspect index-build/alignment seconds, mapped queries, total retained best hits, and maximum/p95 best-hit multiplicity in the JSON. Inspect process resource measurements in the log and monitor allocated-job RAM/disk on the server. Alignment measurements include index construction; indexes are rebuilt for each main-script capacity run. This is a distinct-sequence sample, not an abundance-weighted read pilot. Rare repetitive queries may be missed, and nonlinear hit volume can dominate larger runs. No full-run runtime/RAM guarantee is inferred.
+
+If feasible, repeat with 50,000 and then 100,000 queries and new output/log names, reusing the same cache and seed. Capacity testing bypasses the materialization guards by loading only the selected queries. It does not construct endpoint features, fold variants, or test final-report memory. A failed capacity run leaves committed counts reusable. Its JSON also has a distinct diagnostic schema and is not accepted as a main or RBC biological report.
+
+### C. Continue the main pipeline from counts
+
+Use the normal full-library main command below, adding:
+
+```bash
+--count-cache "$CSRNA_CACHE" --quality-detail counts-only
+```
+
+Omit `--count-only` and `--alignment-capacity-queries`. Use exactly one `--quality-detail` argument matching the cache. Completed counts and paired validation are reused; alignment, global feature discovery, folding and reporting run normally. The resulting schema-2 report opens in the existing dashboard and can precede RBC diagnostics as before. New reports record cache provenance under `counting_checkpoint`.
+
+The default 250,000-per-sample and 500,000-union guards still protect downstream memory. If exceeded, the message identifies the retained database; no counts are discarded. Increase `--max-distinct-sequences` and `--max-total-distinct-sequences` only after assessing downstream resources. This change does **not** make alignment, feature construction, or JSON serialization disk-backed. If those stages cannot fit, further engineering is needed; repeatedly raising limits is not a capacity solution.
+
+Use new output filenames for repeat measurements. `--overwrite` is only needed when intentionally replacing a previously published JSON, not for recovering an incomplete counting stage. Keep the cache until successful analysis and backup; it is an intentional intermediate and may be large.
+
+### Verification
+
+```bash
+CSRNA_TEST_TOOLS=1 python "$CSRNA_CODE/test_count_cache.py"
+python "$CSRNA_CODE/csrna_pipeline.py" --self-test-tools
+CSRNA_TEST_TOOLS=1 python "$CSRNA_CODE/test_rbc_diagnostics.py"
+```
+
+The counting tests compare positional quality sums and counts with the legacy reader, inject an interruption between checkpoints, check completed-cache reuse, input-policy invalidation, malformed mates, locks, both memory guards, unrelated-file protection, uniform query sampling, and real-tool feature/count equivalence. These fixtures test behavior, not server-scale throughput.
+
+## Preparation documentation update — 2026-10-12
+
+The lab's `RNA_Sequencing_Documentation.docx` reports Watchmaker mRNA Library Prep Kit used without RNA selection, 1 ng RNA input, strand-specific construction, unique dual indexes, and Fragment Analyzer assessment. The batch manifest now records this provenance. Fragmentation is **unconfirmed**, read-to-RNA orientation remains **unverified**, and adapter trimming and UMI status remain unknown. UDI sample indexes do not establish molecular identifiers. The phrase “150 nt” does not resolve cycles per mate; verify FASTQ lengths and run settings.
+
+The document reports 24 PCR cycles, conflicting with earlier sample-specific values for several groups. `pcr_cycles` retains the earlier recorded values (RBC remains blank pending sample-specific confirmation); `pcr_cycles_document_reported` records 24 separately. `pcr_cycles_review_status` marks conflicting, consistent, or unresolved sample-specific records. Neither record is silently preferred for count correction. Fragment Analyzer assessment is recorded as a procedure, not proof that each sample passed a DNA-contamination test.
+
+Endpoint clusters remain descriptive observed-read features. Library fragmentation and cDNA synthesis can create boundaries; even a reconstructed library insert need not be a native RNA molecule. Endpoint peaks, discrete/diffuse patterns, and predicted fragment folds do not establish native csRNA species or surface localization. Prioritize RNA-category composition, parent support, coverage, and replicate consistency while preparation details are unresolved. No strand filtering, trimming, UMI inference, automatic deduplication, or numerical PCR correction was introduced.
+
+**Applying the update:** copy the updated manifest to the server and merge its annotation columns into your working manifest while preserving correct FASTQ paths and any newer verified metadata. New main reports include the supplied metadata and preparation warnings. Existing JSON reports remain unchanged and retain their original metadata. For RBC analysis, the current manifest supplies diagnostic annotations, while `main_analysis_sample_metadata` preserves the original main-report snapshot. Sample identities and reference/input integrity checks remain enforced. Updated code or metadata requires a new RBC output directory; existing completed reports are not rewritten. The dashboard explains endpoint limitations even for older reports and exposes current versus original RBC metadata explicitly.
+
+## Start here: main analysis, optional RBC extension, and dashboard
+
+This walkthrough uses the current 15-library paired FASTQ batch. Run the main analysis first; RBC diagnostics is an **optional, separate post-analysis step**. Both reports open in the same read-only Streamlit application, using different pages. The browser does not run alignment or change counts.
+
+1. [Prepare files and environment](#1-prepare-files-and-environment).
+2. [Validate and run the main pilot](#2-validate-and-run-the-main-pilot).
+3. [Decide whether to run the complete main libraries](#3-decide-whether-to-run-the-complete-main-libraries).
+4. [Optionally run RBC diagnostics](#4-optionally-run-rbc-diagnostics-after-main-analysis).
+5. [Open the reports in the web application](#5-open-the-reports-in-the-web-application).
+6. [Explore, interpret, and export](#6-explore-interpret-and-export-results).
+7. [Troubleshoot and rerun](#7-troubleshoot-and-rerun).
+
+The dated audits later in this document describe earlier datasets and versions. Their historical sample counts, test counts, replication status, and report-size measurements are not findings from a newly submitted batch. For this batch, the 15 samples are confirmed independent biological samples; preparation, UMI, and native-end completeness remain unknown.
+
+### 1. Prepare files and environment
+
+On the Linux analysis server, the examples assume:
+
+```text
+~/reconstructed_pipeline/
+    csrna_pipeline.py
+    csrna_rbc_diagnostics.py
+    test_rbc_diagnostics.py
+    samples_recent_batch.csv
+    csrna_visualizer/              # needed only where you run the dashboard
+    references/
+        mouse_combined_with_rRNA_clean_dedup.fa
+~/sequencing_data/
+    <the 30 original R1/R2 .fastq.gz files>
+    samples_recent_batch.csv       # working copy of the manifest
+    results/
+```
+
+Keep both analysis scripts beside each other: the RBC script imports input-reading helpers from the main script. Supply the actual combined reference FASTA; it is not downloaded or reconstructed automatically. The same reference must be used for main and RBC analysis. If your reference lives elsewhere, change `CSRNA_REFERENCE` below. Do not use the MultiQC HTML or the `.tar` archive as a read input; use the extracted FASTQs without decompressing the `.gz` files.
+
+Activate your existing working environment. For the previously configured home-directory installation:
+
+```bash
+source "$HOME/miniforge3/etc/profile.d/conda.sh"
+conda activate "$HOME/envs/csrna"
+```
+
+Adjust the installation prefix if yours differs. If Conda is available but this environment does not yet exist, create it once, then activate it:
+
+```bash
+conda create --prefix "$HOME/envs/csrna" --override-channels \
+  -c conda-forge -c bioconda \
+  python=3.12 bowtie2=2.5.5 viennarna=2.7.2
+conda activate "$HOME/envs/csrna"
+```
+
+Conda itself must already be available; an environment-creation command does not install Conda. If it is missing, use your institution's approved user-level installation or software modules. No system Python upgrade is needed. The main script needs Python >=3.10, `bowtie2`, `bowtie2-build`, and `RNAfold`; the RBC extension does not call RNAfold. Jupyter is optional.
+
+In the same server terminal, define paths and prepare the working directory:
+
+```bash
+CSRNA_CODE="$HOME/reconstructed_pipeline"
+CSRNA_DATA="$HOME/sequencing_data"
+CSRNA_REFERENCE="$CSRNA_CODE/references/mouse_combined_with_rRNA_clean_dedup.fa"
+cd "$CSRNA_DATA"
+mkdir -p results
+# Copy only if absent; preserve any metadata edits in an existing manifest.
+if [ ! -e samples_recent_batch.csv ]; then
+  cp "$CSRNA_CODE/samples_recent_batch.csv" samples_recent_batch.csv
+fi
+python --version
+command -v bowtie2 bowtie2-build RNAfold
+```
+
+Review `samples_recent_batch.csv` before running. Required columns are `sample_id,r1,r2,condition,replicate`; relative mate paths resolve beside the manifest. The supplied file lists all 15 samples separately. Keep conditions `BMDC`, `BMDC_CpG`, `BMDM`, `M1`, and `RBC`; the extension selects **exactly `RBC`**. Retain confirmed biological replication and known PCR metadata, and leave unknown preparation details unknown. Sample indexes are not UMIs. Do not invent an adapter sequence or apply a guessed trimming procedure.
+
+For an unrelated single-end dataset, use repeated `--sample NAME=/path/reads.fastq.gz` instead of `--manifest` and `--pair-handling`. See [Run the updated pipeline](#run-the-updated-pipeline) and [Full-library inputs and quality evidence](#full-library-inputs-and-quality-evidence) for FASTA/CSV rules. The RBC extension requires paired FASTQs and a paired manifest.
+
+### 2. Validate and run the main pilot
+
+Run the software checks before processing the batch:
+
+```bash
+python "$CSRNA_CODE/csrna_pipeline.py" --self-test
+python "$CSRNA_CODE/csrna_pipeline.py" --self-test-tools
+```
+
+Proceed only when both commands succeed. These checks validate the implementation and installed tools; they do not validate the new biological libraries. Use the institution's compute-job allocation for long runs, with at least as many allocated CPUs as `--threads`.
+
+Start with a reproducible 1,000-pair pilot per library:
+
+```bash
+/usr/bin/time -v python "$CSRNA_CODE/csrna_pipeline.py" \
+  --manifest "$CSRNA_DATA/samples_recent_batch.csv" \
+  --pair-handling r1-only \
+  --analysis-mode exploratory \
+  --input-scope selected_subset \
+  --pilot-pairs 1000 --sampling-seed 20261007 \
+  --reference "$CSRNA_REFERENCE" \
+  --report-detail summary --quality-detail counts-only \
+  --top-fragments 1 --max-fold-variants 1 \
+  --threads 4 \
+  --output "$CSRNA_DATA/results/recent_batch_pilot.json" \
+  > "$CSRNA_DATA/results/recent_batch_pilot.stdout.log" \
+  2> "$CSRNA_DATA/results/recent_batch_pilot.log"
+echo "Exit code: $?"
+```
+
+`/usr/bin/time -v` is for Linux. On macOS, omit that prefix or use `/usr/bin/time -l`. The command validates **every R1/R2 pair**, then maps the sampled R1 observations; R2 is validated but not mapped by the main pipeline. Sampling reduces alignment work, not whole-file validation/checksum time. These are R1 read counts, not paired-insert or molecule counts. No controls were designated for this batch, so use `exploratory` mode rather than treating another cell type as a negative control.
+
+The pilot produces up to 15,000 R1 observations. `summary` preserves feature counts and QC while omitting individual alignments and unused reference metadata. `counts-only` still checks FASTQ syntax but omits positional quality summaries. Small folding budgets limit structure predictions, not mapping or feature discovery. Use `--quality-detail positional`, `--report-detail complete`, or larger folding budgets only when those outputs are needed and memory permits.
+
+Check the exit code immediately: **0 means success**. Inspect warnings and resource use:
+
+```bash
+tail -n 60 "$CSRNA_DATA/results/recent_batch_pilot.log"
+python - "$CSRNA_DATA/results/recent_batch_pilot.json" <<'PY'
+import json, sys
+with open(sys.argv[1]) as handle:
+    report = json.load(handle)
+assert report.get('status') == 'complete', 'Report is not complete'
+print('Complete report; scope:', report['parameters']['input_scope'])
+print('Samples:', ', '.join(m['sample_id'] for m in report['sample_metadata']))
+PY
+```
+
+Do not use an old output as evidence that a failed rerun succeeded. Review **Overview** and **Replicate QC** in the dashboard before scaling up. An existing successful main pilot is sufficient to start the optional RBC extension; completing the entire main dataset first is not required.
+
+### 3. Decide whether to run the complete main libraries
+
+For libraries that exceed counting limits, use the resumable counting and capacity workflow above first. The command below without `--count-cache` uses legacy in-memory counting.
+
+First repeat the pilot with `--pilot-pairs 10000` and new output/log filenames. Compare runtime, maximum resident memory, mapping rates, and observed feature counts. Sampling variation is expected. Full-library capacity has not been established for this batch: the main pipeline stores distinct sequences and analysis structures in memory, and defaults to a guard of 250,000 distinct sequences **per sample**. Do not disable that guard simply to suppress a failure, or split one library into artificial biological samples.
+
+When resources have been assessed, the complete R1 command is:
+
+```bash
+/usr/bin/time -v python "$CSRNA_CODE/csrna_pipeline.py" \
+  --manifest "$CSRNA_DATA/samples_recent_batch.csv" \
+  --pair-handling r1-only \
+  --analysis-mode exploratory \
+  --input-scope full_library --pilot-pairs 0 \
+  --reference "$CSRNA_REFERENCE" \
+  --report-detail summary --quality-detail counts-only \
+  --top-fragments 1 --max-fold-variants 1 \
+  --threads 4 \
+  --output "$CSRNA_DATA/results/recent_batch_full.json" \
+  > "$CSRNA_DATA/results/recent_batch_full.stdout.log" \
+  2> "$CSRNA_DATA/results/recent_batch_full.log"
+echo "Exit code: $?"
+```
+
+This retains the default memory guard and intentionally small folding budget. A guard failure requires resource/design review, not interpretation of partial counts. Main-pipeline runs restart analysis; they do not resume from RBC checkpoints. Keep pilot and full reports separately, and compare cell types using one jointly processed main report with consistent scope and settings.
+
+### 4. Optionally run RBC diagnostics after main analysis
+
+Skip this section if only the main landscape analysis is needed. Otherwise, keep the original paired FASTQs accessible and verify the companion:
+
+```bash
+CSRNA_TEST_TOOLS=1 python "$CSRNA_CODE/test_rbc_diagnostics.py"
+```
+
+Run the RBC pilot using the successful main report, original manifest, and identical reference:
+
+```bash
+/usr/bin/time -v python "$CSRNA_CODE/csrna_rbc_diagnostics.py" \
+  --analysis-report "$CSRNA_DATA/results/recent_batch_pilot.json" \
+  --manifest "$CSRNA_DATA/samples_recent_batch.csv" \
+  --reference "$CSRNA_REFERENCE" \
+  --output-dir "$CSRNA_DATA/results/rbc_diagnostic_pilot" \
+  --index-cache "$CSRNA_CODE/reference_indexes" \
+  --pilot-pairs 10000 --sampling-seed 20261007 --threads 4 \
+  > "$CSRNA_DATA/results/rbc_diagnostic_pilot.stdout.log" \
+  2> "$CSRNA_DATA/results/rbc_diagnostic_pilot.log"
+echo "Exit code: $?"
+```
+
+Use `recent_batch_full.json` instead if that is the report you wish to associate with the diagnostics. Sample identities and reference checksums must agree. The extension validates all RBC pairs and samples both mates together, then aligns R1 and R2 **independently** in end-to-end and local modes. It does not reconstruct inserts or add local matches to the main feature counts.
+
+After inspecting this pilot and available disk/RAM/time, run all RBC pairs:
+
+```bash
+/usr/bin/time -v python "$CSRNA_CODE/csrna_rbc_diagnostics.py" \
+  --analysis-report "$CSRNA_DATA/results/recent_batch_pilot.json" \
+  --manifest "$CSRNA_DATA/samples_recent_batch.csv" \
+  --reference "$CSRNA_REFERENCE" \
+  --output-dir "$CSRNA_DATA/results/rbc_diagnostic_full" \
+  --index-cache "$CSRNA_CODE/reference_indexes" \
+  --pilot-pairs 0 --sampling-seed 20261007 --threads 4 \
+  > "$CSRNA_DATA/results/rbc_diagnostic_full.stdout.log" \
+  2> "$CSRNA_DATA/results/rbc_diagnostic_full.log"
+echo "Exit code: $?"
+```
+
+A full RBC run can follow a main **pilot** report: the extension reads the original FASTQs, not just the main pilot's selected sequences. Disk-backed SQLite reduces whole-library Python memory pressure, but storage and all-best-hit alignment volume can be substantial. Full-server throughput remains unverified.
+
+Each RBC workspace contains `rbc_diagnostics.json` for the dashboard, `sequence_evidence.tsv.gz` for detailed sequence evidence, `parent_counts.tsv` for raw-parent counts/RPM, and `diagnostics.sqlite` plus logs/configuration/query data for audit and resume. Pilots also retain sampled paired FASTQs. Keep this workspace to resume. Repeat the exact command to reuse completed stages; changing inputs, code, or options requires a new directory. Never run two writers against one workspace.
+
+Optional origin screens need appropriate supplied FASTAs. Add one or more of these flags to either RBC command, with real paths and a new output directory:
+
+```bash
+--screen-reference genome=/absolute/path/to/mouse_genome.fa \
+--screen-reference microbial=/absolute/path/to/microbial_reference.fa \
+--screen-reference technical=/absolute/path/to/technical_reference.fa
+```
+
+Only add `--adapter-sequence` when the actual adapter sequence is confirmed. Omitted screens remain `not_tested`, not negative. Default acceptance gates are `--min-aligned-length 30 --min-aligned-fraction 0.5 --max-edit-rate 0.1`; these are configurable diagnostic thresholds, not universal biological definitions. See [RBC_DIAGNOSTICS.md](RBC_DIAGNOSTICS.md) for all outcome labels, thresholds, provenance checks, and recovery details.
+
+### 5. Open the reports in the web application
+
+**Recommended: analyze on the server and visualize on your workstation.** Only JSON reports are needed by the dashboard; FASTQs, indexes, and SQLite do not need to be copied. Run the following on your **Mac**, not inside the server SSH session (adjust the hostname if your institution provides a different SSH address):
+
+```bash
+mkdir -p "$HOME/Documents/wang-lab/reconstructed_pipeline/results/server_batch"
+scp sohamms3@huawang3-serv-01:~/sequencing_data/results/recent_batch_pilot.json \
+  "$HOME/Documents/wang-lab/reconstructed_pipeline/results/server_batch/"
+# Optional: only after RBC diagnostics completes.
+scp sohamms3@huawang3-serv-01:~/sequencing_data/results/rbc_diagnostic_pilot/rbc_diagnostics.json \
+  "$HOME/Documents/wang-lab/reconstructed_pipeline/results/server_batch/"
+```
+
+For full runs substitute the full report/workspace paths; keep pilot and full copies in separate local directories so the RBC filenames do not overwrite one another. The paths inside a copied report may still refer to the server; copying the JSON does not copy the detailed evidence tables.
+
+Install the dashboard dependencies once in the local Python environment you will use, then launch:
+
+```bash
+cd "$HOME/Documents/wang-lab/reconstructed_pipeline"
+python -m pip install -r csrna_visualizer/requirements.txt
+python csrna_visualizer/run.py \
+  --report "$PWD/results/server_batch/recent_batch_pilot.json"
+```
+
+The existing Mac installation can use `/opt/anaconda3/bin/python` instead of `python` for both commands. The dashboard requires Python >=3.10 and its requirements; Bowtie2 and RNAfold are not needed just to visualize reports.
+
+1. Keep that terminal running and open **http://127.0.0.1:8501/** in your browser.
+2. The main report is loaded by `--report`. To change it, expand **Open a pipeline report** in the sidebar and enter its local path or upload its JSON. Clear an uploaded file before switching back to a path; uploads take precedence. Prefer paths for reports above the default 200 MB upload limit.
+3. To view the optional report, select **RBC diagnostics** under **Explore**. Enter the local path to `rbc_diagnostics.json` in **RBC diagnostic JSON path**, press Enter, or upload that file. This page uses its own loader; do not pass the RBC JSON to the launcher's main `--report` argument.
+4. Return to another sidebar page to view the main report. With only an RBC report, launch `python csrna_visualizer/run.py` without `--report`, then select **RBC diagnostics**.
+5. Stop with **Ctrl+C** in the launching terminal. To restart after a code update, run the same command again and refresh the browser. If port 8501 is already occupied, stop the known old launcher or use `--port 8502` and open http://127.0.0.1:8502/.
+
+**Alternative: run the dashboard on the server through SSH.** Install the visualizer requirements in the server environment, launch `python "$CSRNA_CODE/csrna_visualizer/run.py" --report "$CSRNA_DATA/results/recent_batch_pilot.json"` there, and leave it running. In a separate **local** terminal create a tunnel:
+
+```bash
+ssh -N -L 8502:127.0.0.1:8501 sohamms3@huawang3-serv-01
+```
+
+Open http://127.0.0.1:8502/ locally. Use **server paths** in this dashboard, because its Python process runs on the server. Keep the SSH tunnel open; Ctrl+C closes it. The launcher binds to localhost, so no public Streamlit port is required. If your compute job runs on a different host, use your institution's approved tunnel route to that host.
+
+### 6. Explore, interpret, and export results
+
+For the main report, start with **inclusive** evidence (exact plus accepted-inexact), then compare exact-only support to see whether a pattern depends on mismatched reads.
+
+| Dashboard page | What to inspect | What the evidence supports |
+|---|---|---|
+| **Overview** | Scope, unmapped fraction, exact/inexact retention, ambiguity, screens actually performed | Whether enough interpretable evidence exists to explore; a high unmapped fraction alone does not identify contamination |
+| **RNA composition** | All-read versus mapped-only denominator, RNA categories, abundant parents, individual replicates | Descriptive makeup of the sequenced preparation; mapped-only percentages omit unresolved material |
+| **Replicate QC** | Review flags, per-condition composition, metadata/PCR differences, feature- versus parent-level profiles, correlation/PCA, recurrence | Reproducibility and possible outliers; flags do not exclude samples, and PCA is not a significance test |
+| **Feature comparisons** | Shared counts/RPM, selected samples and track, scope restrictions | Descriptive differences under consistent processing; subset fold rankings remain disabled |
+| **Parent explorer** | Supported endpoint pairs, coverage, full-length-compatible/discrete/diffuse patterns | Locations of observed read evidence on a parent; peaks do not prove native molecular ends |
+| **Feature library** | Support tiers, number of libraries detected, sequences, available reference and variant folds | Candidate features for follow-up; singleton evidence and predicted structures require particular caution |
+| **RBC diagnostics** (optional) | Library/mate selection, mode outcomes, RNA composition, top parents, complexity, clipping, origin screens, pair agreement | Whether local matching recovers additional sequence evidence and which unresolved sequences merit investigation |
+
+In RBC diagnostics, inspect each replicate and mate separately. `local_only` can reflect partial RNA matches, adapter sequence, or other clipped material; it is not automatically a valid fragment species. `neither_accepted` includes sequences with no match and sequences whose reported matches failed the gates. Short matches below 30 nt fail the default span gate, so absence from accepted counts does not establish biological absence. Homopolymer/low-complexity labels overlap and do not remove reads. Compare read-weighted versus distinct-sequence-weighted frequencies to distinguish repeated sequences from sequence diversity.
+
+Genome/microbial/technical matches are non-exclusive evidence, not definitive source calls. Independent-mate agreement is not a native paired alignment or insert-length test. Do not sum R1 and R2 counts as independent molecules, merge RBC local-match counts into main endpoint matrices, or compare full-depth RBC diagnostics directly with other cells' small pilots. Use the same joint main report for cross-cell comparisons.
+
+Neither report proves cell-surface localization, glycosylation, modification, degradation, or biological function. Replication supports consistency, but unknown preparation, PCR amplification, reference coverage, and lack of negative controls still constrain interpretation. Read boundaries remain observed endpoints until insert completeness is established.
+
+To share results, use **Download table · CSV** for tables with scope/provenance labels, chart camera icons for SVG, and **Prepare interactive HTML export** for offline interactive charts. The data grid's own CSV shortcut may omit the added provenance columns. Export raw integer feature counts from **Replicate QC** for separately designed statistical analysis. Record report scope, evidence track, normalization, reference, and diagnostic thresholds alongside every figure; retain the original JSON and logs.
+
+### 7. Troubleshoot and rerun
+
+| Symptom | Action |
+|---|---|
+| `conda: command not found` or missing executable | Initialize the correct Conda installation, activate the environment, and rerun `command -v` and tool tests |
+| Missing FASTQ, unequal mate counts, or mismatched names | Verify the manifest against actual files; preserve matching R1/R2 pairs and correct the input before retrying |
+| Main output already exists | Choose a new filename; use `--overwrite` only when intentionally replacing that report |
+| Distinct-sequence guard or memory failure | Assess RAM and increasing pilot sizes; a failed run is not a partial successful library analysis |
+| RBC workspace configuration/checksum mismatch | Use a new output directory for changed settings, source code, or inputs; keep the shared index cache |
+| RBC `.lock` remains after an interruption | Check that no process is using that workspace/cache before removing a stale lock; never remove an active run's lock |
+| Report rejected by dashboard | Use main schema-2 JSON in the main loader and completed RBC diagnostic JSON on **RBC diagnostics**; do not load logs or TSV files as JSON |
+| Empty/undefined correlation, PCA, or missing folds | Review eligible counts and filters; constant profiles have undefined correlations, identical profiles have no ordination, and folding is budget-limited |
+| Dashboard is stale or port is occupied | Restart the correct launcher, refresh the browser, and confirm the report path; use an alternate port if necessary |
+
+For tests after later code updates, run the two main checks above, `CSRNA_TEST_TOOLS=1 python "$CSRNA_CODE/test_rbc_diagnostics.py"`, and `python csrna_visualizer/test_visualizer.py` from the local `reconstructed_pipeline` directory. A passing test suite is evidence for the tested cases, not a guarantee about every input or server capacity.
+
+## Technical reference and historical validation
+
+The sections below preserve design details, annotations, and dated validation records. Use the walkthrough above for the current paired batch and optional RBC workflow.
 
 ## Complete-library validation and scale limits (2026-09-26)
 
@@ -325,6 +703,17 @@ Only the final report persists. SAM is streamed; temporary reference/query FASTA
 
 Reference sequences, distinct reads, quality summaries, best-hit evidence, and the final report are held in memory. Retaining unresolved evidence and all-hit mapping can be expensive on very large/repetitive libraries. Disk reduction is not a claim of constant-memory processing. No undocumented hit cap or truncated control library is used to improve speed.
 
+## RBC post-analysis and review improvements — 2026-10-11
+
+Run the separate **`csrna_rbc_diagnostics.py` after the main analysis**. It reads the main JSON plus the original paired manifest and selects only samples whose condition is RBC in both sources. It does not alter the core counts. See [RBC_DIAGNOSTICS.md](RBC_DIAGNOSTICS.md) for complete server commands, reference screens, output definitions, resume behavior, limitations, and tests.
+
+The companion compares independent R1/R2 end-to-end and local alignments, retains a reproducible paired pilot, measures sequence complexity and homopolymers, and optionally screens secondary reference FASTAs. Counts, pair membership, and best hits are disk-backed in SQLite. Reference indexes are cached; inputs, configuration, source code, and retained pilots are checked before resuming. It requires `csrna_pipeline.py` beside it for validated input helpers, but importing that script does not execute main analysis. Full-library disk/time capacity remains to be measured on the actual server.
+
+Local alignment boundaries are not native fragment ends. The companion uses raw reference IDs without the main pipeline's equivalence projections, so its parent counts must not be merged with strict endpoint counts. The current scope is independent-mate alignment, not native paired alignment or insert reconstruction. Origin matches are nonexclusive evidence, not contamination verdicts. Genome screens do not provide splice-aware or exon/intron annotation. Complexity labels never automatically remove reads, and no adapter/UMI protocol is inferred.
+
+The dashboard adds **RBC diagnostics** as a separate report view. Main-report views now distinguish catalogue membership from recurrence, show singleton/one-library/multiple-library support tiers, provide parent-level replicate profiles, and flag high unmapped fractions, low eligible counts, and large within-condition mapping differences. Review thresholds are displayed and do not automatically exclude samples. Biological-replicate status is taken from metadata.
+
+Main script version 2.1.2 changes documentation and renames the misleading performance field `mapped_query_count` to `queried_sequence_count`. Mapping, assignment, feature construction, and count normalization are unchanged. Legacy reports remain supported.
 
 ## Accuracy and performance audit — 2026-10-08
 
@@ -335,7 +724,6 @@ Compiled input checks preserve accepted sequence alphabets and Phred+33 validati
 `--max-total-distinct-sequences` defaults to 500,000 across libraries, supplementing the 250,000 per-library guard. Exceeding either guard fails explicitly rather than discarding reads. These cardinality guards are not RAM guarantees; setting either to 0 disables that guard. Native paired alignment, insert reconstruction, and bounded-memory full-library processing remain unimplemented. R2 is validated; mapping uses R1 only.
 
 Validation includes 59 backend tests, six actual Bowtie2/RNAfold workflows, and 16 frontend tests. A fresh 3,000-read run against the full combined reference reproduced all checked feature counts, category matrices, endpoint profiles, parent landscapes, support summaries, and family counts (574 features). This checks the existing local diagnostic subset, not the new server-resident batch. Identical biological profiles now correctly produce no PCA ordination. Biological replication does not establish native molecular ends, UMI identity, or absolute surface abundance.
-
 
 ## Replicate libraries and paired-file input — 2026-10-07
 
@@ -425,7 +813,6 @@ Then use **Parent explorer** to compare observed endpoints and **Feature library
 
 The new server-resident 30 FASTQs were not available locally and have not been run here. Synthetic paired FASTQs test ingestion; the existing real R1 subset tests biological count preservation. This does not establish full-library resource capacity or native paired-end correctness. The user subsequently confirmed independent biological samples; the current manifest records this confirmation. Preparation details remain unknown. Native paired-end mapping/insert reconstruction and disk-backed whole-library processing remain future work.
 
-
 ## Goal 2 — shared RNA landscape comparison (2026-10-04)
 
 The pipeline now packages its existing all-category shared features into a `landscape_comparison` report. It describes **observed-read endpoint features**; the molecular-end and full-library scale limitations documented below still apply. No new output files, alignment filters, candidate rules, or inferential statistics are introduced.
@@ -469,11 +856,9 @@ for contrast in landscape['pairwise_contrasts']:
 
 Four additional regression tests cover cross-category feature union, normalization with unequal library sizes, both directions of comparison, control-only features, all sample pairs, metadata ordering, matrix validation, empty features/tracks, subset restrictions, and non-mutation. Real Bowtie2/RNAfold fixtures also validate the new report against actual mapped feature counts.
 
-
 ## Segment 1 — shared data contracts
 
 `Hit` records a raw reference interval, orientation, CIGAR, edit distance, and independently checked exactness. `Mapping` retains all reported equal-best AS hits. DNA/RNA normalization and hashing helpers are shared by every stage. These contracts preserve raw evidence separately from the later biological assignment model.
-
 
 ## Segment 2 — input, qualities, and reference annotation
 
@@ -488,18 +873,15 @@ The index is built from precisely the selected reference. Bowtie2 maps deduplica
 
 `unique_exact_rrna` is retained as a legacy regression helper; it is no longer the production eligibility gate.
 
-
 ## Segment 4 — coordinate primitives and compatibility helpers
 
 `IntervalIndex` finds interval overlaps without recounting a sequence at several possible loci. `merge_intervals` merges positive overlaps only, separately by parent and orientation. `sequence_for_region` extracts the reference slice with orientation conversion; `rpm` rejects invalid denominators. These working primitives remain in use for coverage and overlap diagnostics.
 
 The old asymmetric `compare_region` helper remains for historical regression checks only. Production feature abundance uses `compare_counts` below; it never calls the old helper.
 
-
 ## Segment 5 — folding and sequence metrics
 
 RNAfold runs with `--noPS`, explicit temperature, timeout, and checked return status. Parsing verifies sequence identity, balanced dot-bracket structure, length, and finite energy, including space-padded zero values. Deliberate length skips use null energy and a status; malformed output fails. Duplicate sequences share cached folds within a run. GC fraction and longest homopolymer are descriptive sequence properties, not assay validation.
-
 
 ## Segment 6 — biological assignment and mismatch evidence
 
@@ -507,18 +889,15 @@ RNAfold runs with `--noPS`, explicit temperature, timeout, and checked return st
 
 `alignment_differences` walks the CIGAR to preserve substitutions and indels. Substitutions include the original read position so the per-sample Phred summaries can be examined. No observed base is changed to the reference, and no mismatch is called a chemical modification.
 
-
 ## Segment 7 — shared fragment species and sample comparisons
 
 `endpoint_clusters` uses bounded spans to prevent chain merging. `build_features` uses actual paired observations to construct one feature set across all samples, records sequence members, and counts exact/inexact support without preselecting high-RPM sequences. It keeps per-sample endpoint histograms. Representative sequences and coordinates come from a real supporting observation.
 
 `compare_counts` applies the same count semantics to target and controls and disables inference in selected-subset mode. `parent_landscape` reports evidence-limited full-length, recurrent-fragment, or diffuse patterns without declaring degradation as established fact.
 
-
 ## Segment 8 — unresolved evidence and sample metadata
 
 `sample_metadata` validates a one-to-one mapping from sample IDs to metadata rows while preserving condition/protocol fields. `unresolved_diagnostics` performs optional local secondary-reference and exact adapter checks only on primary-unmapped sequences. Sources and hashes are recorded. Evidence can match several diagnostic sources and is never promoted automatically to confirmed organism identity, contamination, or a revised primary count.
-
 
 ## Segment 9 — complete run and publication
 
@@ -533,11 +912,9 @@ The matrices, metadata, family counts, endpoint patterns, observed/reference seq
 
 The original 17 deterministic checks still exercise input rejection, normalization, exactness, balanced-indel handling, strand extraction, interval overlap, control accounting, folding error handling, and safe publication. These protect working low-level behavior. Historical helper tests are not an assertion that the old asymmetric comparison remains the production analysis.
 
-
 ## Segment 11 — redesign checks
 
 Additional tests cover non-rRNA references, category annotation, sequence-equivalence resolution, verified forward/reverse projections, palindrome ambiguity, family versus coordinate resolution, accepted mismatches, terminal-indel rejection, bounded endpoint clusters, paired features, count conservation, post-aggregation thresholds, symmetric ratios, selected-subset protection, Phred summaries, CIGAR mismatch positions, metadata validation, and cautious parent-pattern labels. Three additional tests cover read-weighted category ambiguity, inclusive threshold boundaries, empty/unambiguous categories, subset labeling, cross-category accounting, and non-mutating QC. Real-tool fixtures also verify alerts after reference equivalence resolution.
-
 
 ## Segment 12 — real-tool and paired-input checkpoints
 
@@ -546,7 +923,6 @@ Additional tests cover non-rRNA references, category annotation, sequence-equiva
 ## Segment 13 — entry point and notebook safety
 
 `main` validates options, checks tools, runs the selected tests or analysis in unique scratch space, and publishes the report. The script guard avoids treating Jupyter kernel arguments as pipeline arguments. The notebook defines the identical implementation before its final execution-control cell; production input paths are placeholders until explicitly supplied by the user.
-
 
 ## Reproducible verification
 
@@ -618,7 +994,6 @@ If a read maps equally to a mature 28S record and its sequence-identical region 
 The supervisor's `csrna_pipeline_0922.docx`, the current reconstructed implementation, `ProjectDocumentation.ipynb`, the original downstream mapping/structural scripts and visualization assumptions, supplied Top100/structural/contig tables, the BMDM SAM, and the combined reference FASTA informed this update. Statements in documents were assessed as reference material; executable changes follow the user's explicit authorization.
 
 Tool behavior follows the official [Bowtie2 manual](https://bowtie-bio.sourceforge.net/bowtie2/manual.shtml) and [RNAfold manual](https://viennarna.readthedocs.io/en/latest/man/RNAfold.html). The previously supplied project URL returned HTTP 404 during the earlier review; it was not used to invent additional biological requirements. The older featureCounts/edgeR/gene-translation branch remains a different gene-level analysis and is not silently mixed with sequence-level fragment counts.
-
 
 ## Goal 2 validation results (2026-10-04)
 

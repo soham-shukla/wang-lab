@@ -9,7 +9,7 @@ TRACKS = ('exact', 'inexact', 'inclusive')
 
 def _validate(report):
     if not isinstance(report, dict) or not str(report.get('schema_version', '')).startswith('2.'):
-        raise ValueError('Choose a csRNA pipeline schema 2 JSON report.')
+        raise ValueError('Choose a completed csRNA pipeline schema 2 analysis JSON. Counting and alignment-capacity artifacts are not biological reports.')
     samples = report.get('samples')
     features = report.get('features')
     if not isinstance(samples, dict) or not samples or not isinstance(features, list) or not all(isinstance(f, dict) for f in features):
@@ -155,7 +155,7 @@ def csv_bytes(frame):
     return safe.to_csv(index=False).encode('utf-8-sig')
 
 
-def replicate_summary(report, track='inclusive', selected=None, categories=None):
+def replicate_summary(report, track='inclusive', selected=None, categories=None, resolution='features'):
     """Descriptive QC only: no pooling, tests, inferred replicates, or PCR correction."""
     import numpy as np
     samples = list(report['samples']) if selected is None else list(selected)
@@ -172,6 +172,14 @@ def replicate_summary(report, track='inclusive', selected=None, categories=None)
     meta = pd.DataFrame(rows, columns=list(dict.fromkeys(['sample_id', 'condition', 'replicate_type', 'pcr_cycles', 'library_preparation'] + [k for r in rows for k in r])))
     features = [f for f in report['features'] if categories is None or f['category'] in categories]
     raw = np.array([[f['counts'][s][track] for f in features] for s in samples], dtype=float).reshape(len(samples), len(features))
+    if resolution not in ('features','parents'):
+        raise ValueError('Unknown replicate profile resolution')
+    if resolution=='parents':
+        parents=list(dict.fromkeys(f['parent_RNA'] for f in features))
+        lookup={p:i for i,p in enumerate(parents)}
+        grouped=np.zeros((len(samples),len(parents)))
+        for j,f in enumerate(features): grouped[:,lookup[f['parent_RNA']]]+=raw[:,j]
+        raw=grouped
     denominators = np.array([report['samples'][s]['rpm_denominator'] for s in samples])
     transformed = np.log1p(raw * 1e6 / denominators[:, None]) / np.log(2) if samples else raw
     # Drop globally absent features. Constant profiles have undefined correlation.
@@ -203,3 +211,37 @@ def replicate_summary(report, track='inclusive', selected=None, categories=None)
                                'Samples examined': len(members), 'Total reads': sum(counts),
                                'Mean sample RPM': sum(c * 1e6 / report['samples'][s]['rpm_denominator'] for c, s in zip(counts, members)) / len(members)})
     return meta, pd.DataFrame(correlation, index=samples, columns=samples), scores, variance, pd.DataFrame(recurrence)
+
+
+def sample_qc(report, min_eligible=50, max_unmapped=.8):
+    """Review flags, not sample exclusion or biological verdicts. Inclusive support."""
+    metadata={m['sample_id']:m for m in report.get('sample_metadata',[])}
+    rows=[]
+    for name,s in report['samples'].items():
+        eligible=sum(f['counts'][name]['inclusive'] for f in report['features'])
+        unmapped=s['unmapped_reads']/s['total_input_reads']
+        flags=[]
+        if unmapped>=max_unmapped:flags.append('High unmapped fraction')
+        if eligible<min_eligible:flags.append('Low eligible read count')
+        rows.append({'Sample':name,'Condition':metadata.get(name,{}).get('condition','unknown'),
+                     'Input reads':s['total_input_reads'],'Eligible reads':eligible,'Unmapped fraction':unmapped,
+                     'Mapped fraction':s['mapped_reads']/s['total_input_reads'],'Review flags':'; '.join(flags) or 'None at these thresholds'})
+    frame=pd.DataFrame(rows)
+    for group in frame.Condition.unique():
+        idx=frame.index[frame.Condition==group]
+        if group!='unknown' and len(idx)>1 and frame.loc[idx,'Mapped fraction'].max()-frame.loc[idx,'Mapped fraction'].min()>=.5:
+            frame.loc[idx,'Review flags']=frame.loc[idx,'Review flags'].str.replace('None at these thresholds','',regex=False).apply(
+                lambda x:(x+'; Large within-condition mapping spread').strip('; '))
+    return frame
+
+
+def support_tiers(report,track='inclusive'):
+    """Observed support across libraries, never independent molecule counts."""
+    rows=[]
+    for f in report['features']:
+        values=[c[track] for c in f['counts'].values()]
+        total=sum(values);detected=sum(n>0 for n in values)
+        tier='No support in selected track' if not total else 'Singleton read' if total==1 else 'One library only' if detected==1 else 'Multiple libraries'
+        rows.append({'Feature':f['id'],'Category':f['category'],'Parent RNA':f['parent_RNA'],
+                     'Total reads':total,'Libraries detected':detected,'Support tier':tier})
+    return pd.DataFrame(rows,columns=['Feature','Category','Parent RNA','Total reads','Libraries detected','Support tier'])

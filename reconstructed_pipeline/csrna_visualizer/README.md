@@ -78,3 +78,23 @@ Replicate QC preserves individual library columns. It provides condition-faceted
 ## Accuracy/performance audit (2026-10-08)
 
 The current 15-library manifest records confirmed independent biological samples and supported PCR-cycle metadata; other preparation details remain unknown. Existing reports retain the metadata recorded at analysis time. New reports expose measured stage durations under **Report details**, excluding final assembly/serialization. Identical normalized profiles correctly have no PCA ordination. Sixteen frontend tests and navigation through all six views with the fresh 574-feature diagnostic report passed. See the [audit report](../PERFORMANCE_ACCURACY_AUDIT.md) for benchmarks and remaining full-library/R1-only limitations.
+
+## RBC post-analysis and review tools (2026-10-11)
+
+Select **RBC diagnostics** to open the independent `rbc_diagnostics.json` produced after the main analysis. The main report and diagnostic report have distinct schemas and loaders. Diagnostic evidence never enters the main endpoint counts. See [RBC instructions](../RBC_DIAGNOSTICS.md).
+
+Replicate QC adds sample review flags and a **Profile resolution** selector for endpoint features versus parent RNA (eligible support). Parent profiles aggregate disjoint eligible features across reference orientations, not all mapped reads. Feature library adds observed support tiers. The combined catalogue is no longer labeled as if every feature were shared. Review flags and support tiers are descriptive; they do not establish statistical significance or exclude samples.
+
+## Preparation documentation update — 2026-10-12
+
+The lab's `RNA_Sequencing_Documentation.docx` reports Watchmaker mRNA Library Prep Kit used without RNA selection, 1 ng RNA input, strand-specific construction, unique dual indexes, and Fragment Analyzer assessment. The batch manifest now records this provenance. Fragmentation is **unconfirmed**, read-to-RNA orientation remains **unverified**, and adapter trimming and UMI status remain unknown. UDI sample indexes do not establish molecular identifiers. The phrase “150 nt” does not resolve cycles per mate; verify FASTQ lengths and run settings.
+
+The document reports 24 PCR cycles, conflicting with earlier sample-specific values for several groups. `pcr_cycles` retains the earlier recorded values (RBC remains blank pending sample-specific confirmation); `pcr_cycles_document_reported` records 24 separately. `pcr_cycles_review_status` marks conflicting, consistent, or unresolved sample-specific records. Neither record is silently preferred for count correction. Fragment Analyzer assessment is recorded as a procedure, not proof that each sample passed a DNA-contamination test.
+
+Endpoint clusters remain descriptive observed-read features. Library fragmentation and cDNA synthesis can create boundaries; even a reconstructed library insert need not be a native RNA molecule. Endpoint peaks, discrete/diffuse patterns, and predicted fragment folds do not establish native csRNA species or surface localization. Prioritize RNA-category composition, parent support, coverage, and replicate consistency while preparation details are unresolved. No strand filtering, trimming, UMI inference, automatic deduplication, or numerical PCR correction was introduced.
+
+**Applying the update:** copy the updated manifest to the server and merge its annotation columns into your working manifest while preserving correct FASTQ paths and any newer verified metadata. New main reports include the supplied metadata and preparation warnings. Existing JSON reports remain unchanged and retain their original metadata. For RBC analysis, the current manifest supplies diagnostic annotations, while `main_analysis_sample_metadata` preserves the original main-report snapshot. Sample identities and reference/input integrity checks remain enforced. Updated code or metadata requires a new RBC output directory; existing completed reports are not rewritten. The dashboard explains endpoint limitations even for older reports and exposes current versus original RBC metadata explicitly.
+
+## Counting/capacity artifacts
+
+Open the completed main analysis JSON as usual after cached counting. `csrna-count-cache/1` and `csrna-alignment-capacity/1` artifacts are not biological reports and are rejected by this dashboard; inspect their JSON and logs directly. RBC diagnostics still requires its own completed report.

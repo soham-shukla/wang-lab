@@ -218,4 +218,39 @@ class AppTests(unittest.TestCase):
         self.assertIn(long_id,fig['data'][0]['y'])
         self.assertEqual(list(fig['data'][0]['x']),[120000,0])
 
+class PostAnalysisTests(unittest.TestCase):
+    def test_support_and_sample_flags(self):
+        from model import sample_qc,support_tiers
+        r=fixture('selected_subset')
+        q=sample_qc(r)
+        self.assertTrue(q['Review flags'].str.contains('Low eligible').all())
+        tiers=support_tiers(r).set_index('Feature')
+        self.assertEqual(tiers.loc['f1','Libraries detected'],2)
+        self.assertEqual(tiers.loc['f2','Libraries detected'],1)
+        self.assertEqual(tiers.loc['f2','Support tier'],'One library only')
+
+    def test_parent_resolution_groups_endpoints(self):
+        from model import replicate_summary
+        r=fixture();r['features'][1]['parent_RNA']=r['features'][0]['parent_RNA']
+        _,correlations,scores,_,_=replicate_summary(r,resolution='parents')
+        self.assertTrue(correlations.isna().all().all()) # one parent: correlation undefined
+        with self.assertRaises(ValueError):replicate_summary(r,resolution='incorrect')
+
+    def test_rbc_empty_page(self):
+        a=AppTest.from_file(str(Path(__file__).with_name('app.py')),default_timeout=30).run()
+        a.sidebar.radio[0].set_value('RBC diagnostics').run()
+        self.assertFalse(a.exception)
+        self.assertTrue(any('csrna_rbc_diagnostics.py' in v.value for v in a.info))
+
+    def test_counting_capacity_artifacts_rejected(self):
+        from model import validate
+        for schema in ('csrna-count-cache/1','csrna-alignment-capacity/1'):
+            with self.assertRaisesRegex(ValueError,'not biological reports'):
+                validate({'schema_version':schema,'status':'complete','counting':{}})
+
+    def test_rbc_rejects_main_report(self):
+        from rbc_view import validate_diagnostics
+        with self.assertRaises(ValueError):validate_diagnostics(fixture())
+
+
 if __name__=='__main__':unittest.main(verbosity=2)

@@ -2,7 +2,7 @@
 """Multi-category csRNA fragment discovery; see README.md. Python >=3.10, standard library.
 
 No statistical significance, surface localization, or probe specificity is inferred.
-The only permanent analysis output is an atomically published JSON report.
+The final analysis report is atomic; optional counting checkpoints persist in SQLite.
 """
 
 # %% Imports and data contracts
@@ -26,9 +26,10 @@ import unittest
 import csv
 import random
 import time
+import sqlite3
 from itertools import zip_longest
 
-VERSION = "2.1.1"
+VERSION = "2.2.0"
 DNA = str.maketrans("ACGTRYSWKMBDHVN", "TGCAYRSWMKVHDBN")
 READ_BASES = re.compile(r'[ACGTN]+')
 REFERENCE_BASES = re.compile(r'[ACGTRYSWKMBDHVN]+')
@@ -165,7 +166,7 @@ def read_manifest(path):
     return rows
 
 
-def paired_r1_records(r1, r2):
+def paired_r1_records(r1, r2, checkpoint_state=None):
     """Validate every mate and identity; emit one R1 observation per pair, never merge."""
     def identity(header, expected):
         parts = header.split()
@@ -178,13 +179,162 @@ def paired_r1_records(r1, r2):
             raise ValueError('FASTQ Illumina mate field contradicts R1/R2 position')
         return token
     with open_text(r1) as one, open_text(r2) as two:
-        for index, pair in enumerate(zip_longest(fastq_records(one, with_name=True), fastq_records(two, with_name=True)), 1):
+        start = checkpoint_state['records'] if checkpoint_state is not None else 0
+        if checkpoint_state is not None:
+            one.seek(checkpoint_state['offsets'][0]); two.seek(checkpoint_state['offsets'][1])
+        for index, pair in enumerate(zip_longest(fastq_records(one, with_name=True), fastq_records(two, with_name=True)), start+1):
             a, b = pair
             if a is None or b is None:
                 raise ValueError(f'Mate record counts differ at pair {index}')
             if identity(a[0], 1) != identity(b[0], 2):
                 raise ValueError(f'Mate identifiers differ at pair {index}')
+            if checkpoint_state is not None:
+                checkpoint_state.update(records=index, offsets=[one.tell(), two.tell()])
             yield a[1], a[2]
+
+
+# Persistent counting is deliberately separate from the in-memory feature engine.
+COUNT_CACHE_VERSION = 1
+
+
+def disk_count_inputs(rows, args, hashes):
+    """Validate/count full paired libraries with atomic per-batch SQLite checkpoints.
+
+    SHA256 input verification is still performed on every invocation. Text seek
+    cookies resume at a committed record; gzip may decompress the prefix to seek.
+    """
+    directory = Path(args.count_cache).expanduser().resolve()
+    directory.mkdir(parents=True, exist_ok=True)
+    lockfile = directory / '.count.lock'
+    try:
+        fd = os.open(lockfile, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        raise ValueError(f'Count cache locked: {lockfile}; verify no writer is active before removing a stale lock')
+    db = None
+    try:
+        with os.fdopen(fd, 'w') as lockhandle:
+            lockhandle.write(str(os.getpid()))
+        database = directory / 'counts.sqlite'
+        if not database.exists() and any(p != lockfile for p in directory.iterdir()):
+            raise ValueError('New count cache requires an empty dedicated directory')
+        existed = database.exists()
+        db = sqlite3.connect(database)
+        if existed and not {'config','counts','progress'} <= {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")} :
+            raise ValueError('Existing SQLite file is not a counting cache; refusing to modify it')
+        db.execute('PRAGMA journal_mode=WAL')
+        db.execute('PRAGMA synchronous=FULL')
+        db.execute('PRAGMA cache_size=-32768')
+        db.execute('PRAGMA temp_store=FILE')
+        db.executescript('''CREATE TABLE IF NOT EXISTS config (id INTEGER PRIMARY KEY, data TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS progress (sample TEXT PRIMARY KEY, records INTEGER NOT NULL, offsets TEXT NOT NULL, complete INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS counts (sample TEXT NOT NULL, sequence TEXT NOT NULL, n INTEGER NOT NULL, quality TEXT,
+                PRIMARY KEY(sample,sequence)) WITHOUT ROWID;''')
+        config = {'version': COUNT_CACHE_VERSION, 'python': list(sys.version_info[:2]),
+                  'quality_detail': args.quality_detail,
+                  'inputs': [{'sample': r['sample_id'], 'mates': [{ 'path': r[m], 'sha256': hashes[Path(r[m])]} for m in ('r1','r2')]} for r in rows]}
+        encoded = json.dumps(config, sort_keys=True)
+        previous = db.execute('SELECT data FROM config WHERE id=1').fetchone()
+        if previous and previous[0] != encoded:
+            raise ValueError('Count-cache inputs, quality policy, or counting format changed; use a new --count-cache directory')
+        if not previous:
+            db.execute('INSERT INTO config VALUES (1,?)', (encoded,)); db.commit()
+        for row in rows:
+            sample = row['sample_id']
+            record = db.execute('SELECT records,offsets,complete FROM progress WHERE sample=?', (sample,)).fetchone()
+            total, offsets, complete = (record[0], json.loads(record[1]), record[2]) if record else (0, [0,0], 0)
+            if complete:
+                print(f'COUNT CACHE — {sample}: reuse {total:,} validated pairs', file=sys.stderr)
+                continue
+            state = {'records':total, 'offsets':offsets}
+            batch = {}
+            def commit_batch(finished=False):
+                # Counts and file offsets commit together; rollback cannot double-count reads.
+                with db:
+                    for sequence, value in batch.items():
+                        if value[1] is None:
+                            db.execute('INSERT INTO counts VALUES (?,?,?,NULL) ON CONFLICT(sample,sequence) DO UPDATE SET n=n+excluded.n', (sample,sequence,value[0]))
+                            continue
+                        old = db.execute('SELECT n,quality FROM counts WHERE sample=? AND sequence=?', (sample,sequence)).fetchone()
+                        count, quality = value
+                        if old:
+                            count += old[0]
+                            if quality is not None:
+                                prior = json.loads(old[1])
+                                quality = {'records':quality['records']+prior['records'],
+                                           'phred_sum':[a+b for a,b in zip(quality['phred_sum'],prior['phred_sum'])],
+                                           'below_q20':[a+b for a,b in zip(quality['below_q20'],prior['below_q20'])]}
+                        db.execute('INSERT OR REPLACE INTO counts VALUES (?,?,?,?)',
+                                   (sample,sequence,count,json.dumps(quality, separators=(',',':')) if quality is not None else None))
+                    db.execute('INSERT OR REPLACE INTO progress VALUES (?,?,?,?)',
+                               (sample,state['records'],json.dumps(state['offsets']),int(finished)))
+                batch.clear()
+            for sequence, quality_string in paired_r1_records(row['r1'], row['r2'], state):
+                if sequence not in batch:
+                    batch[sequence] = [0, {'records':0,'phred_sum':[0]*len(sequence),'below_q20':[0]*len(sequence)} if args.quality_detail=='positional' else None]
+                value = batch[sequence]; value[0] += 1
+                if value[1] is not None:
+                    q = value[1]; q['records'] += 1
+                    for i, char in enumerate(quality_string):
+                        score = ord(char)-33; q['phred_sum'][i] += score; q['below_q20'][i] += score<20
+                if state['records'] % args.count_checkpoint_records == 0:
+                    commit_batch()
+                    print(f'COUNT CHECKPOINT — {sample}: {state["records"]:,} validated/count pairs', file=sys.stderr)
+            if not state['records']:
+                raise ValueError(f'Empty paired library: {sample}')
+            commit_batch(True)
+        audit = {}
+        statistics = {}
+        for row in rows:
+            sample = row['sample_id']
+            total = db.execute('SELECT records FROM progress WHERE sample=? AND complete=1', (sample,)).fetchone()[0]
+            distinct, counted = db.execute('SELECT count(*),sum(n) FROM counts WHERE sample=?', (sample,)).fetchone()
+            if counted != total: raise RuntimeError('Persistent count conservation failed')
+            statistics[sample] = {'reads':total,'distinct_sequences':distinct}
+            audit[sample] = {'r1':row['r1'],'r2':row['r2'],'validated_pairs':total,'analyzed_r1_reads':total,
+                            'sampling_seed':None,'sampling':'all_pairs','pair_handling':'r1_only_r2_validated','r2_used_for_alignment':False}
+        union = db.execute('SELECT count(*) FROM (SELECT sequence FROM counts GROUP BY sequence)').fetchone()[0]
+        stats = {'samples':statistics,'union_distinct_sequences':union,'database':str(database),
+                 'checkpoint_records':args.count_checkpoint_records,'input_verification':'SHA256 each invocation; final SHA256 before report publication',
+                 'scope':'Complete paired-file validation and R1 counting only; alignment/feature capacity is separate'}
+        if args.count_only:
+            return None, None, audit, stats
+        if args.alignment_capacity_queries:
+            rng = random.Random(args.sampling_seed); chosen = []; eligible = 0
+            for (sequence,) in db.execute('SELECT sequence FROM counts WHERE length(sequence)>=? GROUP BY sequence ORDER BY sequence', (args.min_read_length,)):
+                eligible += 1
+                if eligible <= args.alignment_capacity_queries: chosen.append(sequence)
+                else:
+                    slot = rng.randrange(eligible)
+                    if slot < args.alignment_capacity_queries: chosen[slot] = sequence
+            stats['eligible_distinct_sequences'] = eligible
+            return sorted(chosen), None, audit, stats
+        # Capacity guards apply to materialization, NEVER to persistent counting.
+        if (args.max_total_distinct_sequences and union>args.max_total_distinct_sequences) or any(args.max_distinct_sequences and x['distinct_sequences']>args.max_distinct_sequences for x in statistics.values()):
+            raise ValueError(f'Counts safely retained in {database}; downstream in-memory capacity guard reached. Run --count-only or --alignment-capacity-queries before assessing higher limits. No recount is required.')
+        libraries = {r['sample_id']:Counter() for r in rows}; qualities = {s:{} for s in libraries}
+        for sample,sequence,count,quality in db.execute('SELECT sample,sequence,n,quality FROM counts ORDER BY sample,sequence'):
+            libraries[sample][sequence] = count
+            if quality is not None: qualities[sample][sequence] = json.loads(quality)
+        return libraries, qualities, audit, stats
+    finally:
+        if db is not None: db.close()
+        lockfile.unlink(missing_ok=True)
+
+
+def capacity_report(sequences, references, tools, args, workdir, stats):
+    """Actual all-best-hit alignment of a bounded uniform distinct-query sample."""
+    started = time.perf_counter()
+    mappings = align_sequences(sequences, references, tools, args.threads, workdir)
+    hits = sorted(len(m.hits) for m in mappings)
+    return {'schema_version':'csrna-alignment-capacity/1','status':'complete','counting':stats,
+            'capacity':{'sampled_queries':len(sequences),'sampling':'uniform distinct sequences without replacement; not abundance-weighted',
+                        'seed':args.sampling_seed,'index_build_and_alignment_seconds':time.perf_counter()-started,
+                        'mapped_queries':sum(bool(n) for n in hits),'retained_best_hits':sum(hits),
+                        'maximum_best_hits_per_query':max(hits,default=0),
+                        'p95_best_hits_per_query':hits[max(0,math.ceil(.95*len(hits))-1)] if hits else 0},
+            'limitations':['A query sample is not a full-library capacity guarantee; rare repetitive sequences may dominate full alignment.',
+                           'Feature construction, folding, and final JSON memory are not benchmarked. Measure process-tree RAM/disk externally.',
+                           'This is a capacity artifact, not a biological report; do not open it in the dashboard or supply it to RBC diagnostics.']}
 
 
 def prepare_manifest_inputs(rows, args, workdir):
@@ -1185,17 +1335,33 @@ def analyze(args, tools, workdir):
     metadata = [{k: v for k, v in row.items() if k not in ('r1', 'r2')} for row in manifest] if manifest else sample_metadata(args.sample_metadata, paths)
     input_paths = dict(paths)
     paired_audit = {}
-    if manifest:
-        paths, paired_audit = prepare_manifest_inputs(manifest, args, workdir)
-    qualities = {name: {} for name in paths}
-    libraries, union_sequences = {}, set()
-    for name, path in paths.items():
-        libraries[name] = load_counts(path, args.counts_complete, args.input_scope == 'selected_subset',
-                                     qualities[name] if args.quality_detail == 'positional' else None, args.max_distinct_sequences)
-        union_sequences.update(libraries[name])
-        if args.max_total_distinct_sequences and len(union_sequences) > args.max_total_distinct_sequences:
-            raise ValueError(f'Combined distinct-sequence limit ({args.max_total_distinct_sequences:,}) exceeded after {name}; '
-                             'no sequences discarded and no report published. Assess whole-run memory before increasing --max-total-distinct-sequences.')
+    count_stats = None
+    if args.count_cache:
+        libraries, qualities, paired_audit, count_stats = disk_count_inputs(manifest, args, hashes)
+        if args.count_only or args.alignment_capacity_queries:
+            if args.count_only:
+                result = {'schema_version':'csrna-count-cache/1','status':'complete','counting':count_stats}
+            else:
+                refs, _ = load_reference(reference_path, args.reference_id)
+                result = capacity_report(libraries, refs, tools, args, workdir, count_stats)
+            if any(sha256(path) != checksum for path,checksum in hashes.items()):
+                raise ValueError('Input changed during counting/capacity analysis; no report published')
+            result.update(input_provenance={str(p):h for p,h in hashes.items()}, parameters=vars(args), tools=tools)
+            return result
+        union_sequences = set()
+        for counts in libraries.values(): union_sequences.update(counts)
+    else:
+        if manifest:
+            paths, paired_audit = prepare_manifest_inputs(manifest, args, workdir)
+        qualities = {name: {} for name in paths}
+        libraries, union_sequences = {}, set()
+        for name, path in paths.items():
+            libraries[name] = load_counts(path, args.counts_complete, args.input_scope == 'selected_subset',
+                                         qualities[name] if args.quality_detail == 'positional' else None, args.max_distinct_sequences)
+            union_sequences.update(libraries[name])
+            if args.max_total_distinct_sequences and len(union_sequences) > args.max_total_distinct_sequences:
+                raise ValueError(f'Combined distinct-sequence limit ({args.max_total_distinct_sequences:,}) exceeded after {name}; '
+                                 'no sequences discarded and no report published. Assess whole-run memory before increasing --max-total-distinct-sequences.')
     if any(sum(libraries[s].values()) != row['analyzed_r1_reads'] for s, row in paired_audit.items()):
         raise RuntimeError('Paired-input/R1 count conservation checkpoint failed')
     checkpoint('input_hashing_validation_and_counting')
@@ -1222,6 +1388,10 @@ def analyze(args, tools, workdir):
     if args.input_scope == 'selected_subset':
         warnings.append('SELECTED SUBSET: counts and QC describe supplied sequences only; biological fold comparisons/candidates disabled.')
     warnings.append('Read counts are not independent molecules without UMI/PCR information; extraction protocols may confound comparisons.')
+    warnings.append('PREPARATION / ENDPOINTS: fragmentation or cDNA synthesis can create library boundaries; endpoint clusters and folds do not establish native RNA species. Strand-specific preparation alone does not verify read-to-RNA orientation.')
+    for row in metadata:
+        if row.get('pcr_cycles_review_status') in ('conflicting_sources', 'sample_specific_confirmation_needed'):
+            warnings.append(f"PREPARATION METADATA — {row['sample_id']}: PCR-cycle sources require review; retain both records and do not numerically correct abundance.")
     for sample, counts in libraries.items():
         total, mapped = sum(counts.values()), 0
         categories, states, assignments, lengths = Counter(), Counter(), Counter(), Counter()
@@ -1417,7 +1587,7 @@ def analyze(args, tools, workdir):
         raise RuntimeError('Input changed during analysis; report not published')
     checkpoint('read_reporting_coverage_and_integrity_recheck')
     return {'schema_version': VERSION, 'created_utc': datetime.now(timezone.utc).isoformat(), 'status': 'complete',
-            'performance': {'stage_seconds': timings, 'mapped_query_count': len(sequences),
+            'performance': {'stage_seconds': timings, 'queried_sequence_count': len(sequences),
                             'scope': 'Elapsed stage times through integrity recheck; excludes final report assembly/serialization. Not a full-library capacity estimate.'},
             'target': None if exploratory else args.target, 'controls': controls, 'parameters': vars(args).copy(), 'tools': tools,
             'paired_input_qc': paired_audit,
@@ -1430,7 +1600,7 @@ def analyze(args, tools, workdir):
                           'verified_projections': model['projections'],
                           'families': model['families'] if args.report_detail == 'complete' else {}},
             'input_provenance': {str(path): checksum for path, checksum in sorted(hashes.items())},
-            'sample_metadata': metadata, 'samples': summaries, 'warnings': warnings, 'qc_alerts': qc_alerts,
+            'counting_checkpoint': count_stats, 'sample_metadata': metadata, 'samples': summaries, 'warnings': warnings, 'qc_alerts': qc_alerts,
             'features': features, 'count_matrices': matrices, 'endpoint_profiles': endpoints,
             'support_reporting': support_report,
             'landscape_comparison': landscape_comparison(features, matrices, metadata, denominators, args),
@@ -1446,14 +1616,15 @@ def analyze(args, tools, workdir):
             'fold_change_ranking': [f['id'] for f in ranking],
             'interpretation': {
                 'coordinates': '0-based half-open; strand is read-to-reference orientation, not automatically biological strand',
-                'features': 'Shared paired-endpoint clusters supported by spanning reads; sequence variants retained; read-length censoring can hide molecular ends',
+                'features': 'Observed spanning-read endpoint clusters, not validated native fragment species; library fragmentation, cDNA synthesis and read-length censoring can alter boundaries',
+                'preparation': 'Use supplied sample metadata. Unknown fragmentation and read-to-RNA orientation remain unconfirmed; UDI indexes do not establish UMIs. Preserve conflicting PCR records without count correction.',
                 'tracks': 'Exact and accepted-inexact counts are disjoint; inclusive is their sum. Eligibility is symmetric across samples.',
                 'family_counts': 'Any resolved-family best hit counted once, even when endpoint/quality eligibility fails; not additive with feature counts',
                 'quality': ('Phred+33 per-position evidence retained' if args.quality_detail == 'positional' else 'Positional quality evidence omitted by request') + '; deduplicated FASTA alignment uses quality-independent scoring',
                 'equivalence': 'Identical-sequence/verified coordinate equivalence resolves RNA sequence evidence, not genomic copy of origin',
                 'diagnostics': 'Optional adapter or secondary-reference matches are non-exclusive clues; not confirmed taxonomy or contamination',
                 'coverage': 'Merged intervals are secondary summaries and never asserted to be intact molecules',
-                'folding': 'Canonical-base observed variants and reference separately; no modeled glycosylation or proven accessibility',
+                'folding': 'Canonical-base observed variants and reference separately; sequenced fragments may be preparation-derived, not intact surface RNA; no modeled glycosylation or proven accessibility',
                 'statistics': 'Descriptive fold rankings only; no p-values, significance, or replicate inference',
                 'limitations': ['Unmapped identity remains unresolved without suitable diagnostic references and experimental context',
                                 'Genome diagnostic alignment is unspliced; failure is not proof of non-genomic origin',
@@ -1486,6 +1657,10 @@ def atomic_report(report, output, overwrite=False):
 
 def parser():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    p.add_argument('--count-cache', help='Dedicated persistent SQLite directory; full paired manifest only')
+    p.add_argument('--count-only', action='store_true', help='Finish persistent counts without materializing them or aligning; output is not a biological report')
+    p.add_argument('--alignment-capacity-queries', type=int, default=0, help='Align this many uniformly sampled distinct cached queries; output is a capacity artifact')
+    p.add_argument('--count-checkpoint-records', type=int, default=10000, help='Atomic counting batch size in pairs')
     p.add_argument("--sample", action="append", default=[], metavar="NAME=PATH")
     p.add_argument('--manifest', help='CSV with sample_id,r1,r2,condition,replicate; relative FASTQ paths resolve beside CSV')
     p.add_argument('--pair-handling', choices=['r1-only'], help='Explicit paired-manifest policy: validate both mates, analyze R1 only')
@@ -1520,7 +1695,7 @@ def parser():
     p.add_argument("--output", default="csrna_results.json")
     p.add_argument("--counts-complete", action="store_true", help="Attest that CSV inputs contain full-library sequence counts")
     p.add_argument('--max-distinct-sequences', type=int, default=250000,
-                   help='Per-library distinct-sequence ingestion limit; fail explicitly rather than discard reads (0 disables; memory is not bounded during mapping)')
+                   help='Per-library memory guard; with --count-cache applied after counting, before materialization (0 disables)' )
     p.add_argument('--max-total-distinct-sequences', type=int, default=500000,
                    help='Whole-run distinct-sequence union limit checked after each library; 0 disables. This is not a RAM guarantee.')
     p.add_argument("--denominator", choices=["total_input", "mapped"], default="total_input")
@@ -1545,6 +1720,14 @@ def parser():
 
 
 def validate_args(args):
+    if args.count_checkpoint_records <= 0 or args.alignment_capacity_queries < 0:
+        raise ValueError('Invalid checkpoint/capacity size')
+    if (args.count_only or args.alignment_capacity_queries) and not args.count_cache:
+        raise ValueError('Counting/capacity modes require --count-cache')
+    if args.count_only and args.alignment_capacity_queries:
+        raise ValueError('Choose count-only OR capacity testing')
+    if args.count_cache and (not args.manifest or args.pilot_pairs or args.input_scope != 'full_library'):
+        raise ValueError('--count-cache currently supports full-library paired manifests only; use --pilot-pairs 0')
     diagnostic_categories(args)
     if args.manifest and (args.sample or args.sample_metadata):
         raise ValueError('Use either --manifest or --sample/--sample-metadata, not both')
@@ -2395,10 +2578,13 @@ def main(argv=None):
             test_with_tools()
         return 0
     validate_args(args)
-    tools = require_tools()
+    tools = {} if args.count_only else require_tools()
     with tempfile.TemporaryDirectory(prefix="csrna-", dir=args.temp_dir) as workdir:
         report = analyze(args, tools, workdir)
     atomic_report(report, args.output, args.overwrite)
+    if args.count_only or args.alignment_capacity_queries:
+        print(f"Complete diagnostic stage: {Path(args.output).resolve()}; not a biological report")
+        return 0
     print(f"Complete: {len(report['features'])} fragment features; {len(report['candidate_feature_ids'])} descriptive candidates; {Path(args.output).resolve()}")
     return 0
 
@@ -2406,6 +2592,6 @@ def main(argv=None):
 if __name__ == "__main__" and "ipykernel" not in sys.modules:
     try:
         raise SystemExit(main())
-    except (ValueError, OSError, EOFError, RuntimeError, subprocess.SubprocessError) as error:
+    except (ValueError, OSError, EOFError, RuntimeError, subprocess.SubprocessError, sqlite3.Error) as error:
         print(f"Pipeline failed; no new report published: {error}", file=sys.stderr)
         raise SystemExit(1)

@@ -67,3 +67,18 @@ Copy the updated script and manifest to the server, keep the confirmed biologica
 - That run recorded 2,314 distinct mapped queries and about 256 seconds for index construction plus alignment. This is a single diagnostic workload, not a server or full-library throughput benchmark. Summary JSON was approximately 2.8 MB.
 
 The browser preview uses this existing local diagnostic subset. It is not a result from the 15 newly confirmed biological libraries. No claim of exhaustive bug absence or full-batch validation is made.
+
+## Resumable counting validation — 2026-10-13
+
+Version 2.2.0 adds optional SQLite counting for full paired manifests. Counts and optional positional-quality arrays commit with R1/R2 seek offsets. Counting is independent of distinct-sequence guards; those guards protect subsequent in-memory materialization. SHA256 verification remains mandatory on each invocation and before publication. Completed caches skip FASTQ validation/counting; partial gzip resume may still decompress a prefix to seek. Only counting is checkpointed, not downstream alignment/features/folding.
+
+Validation completed locally:
+
+- 59 existing unit tests and six real Bowtie2/RNAfold workflows passed.
+- 10 new counting tests passed, including an interruption after a committed batch, duplicate/quality conservation across restart, completed-cache reuse, invalidation, malformed mates, locks, both memory guards, database protection, sampling, and real-tool downstream equivalence.
+- 10 RBC tests and 21 frontend tests passed; synchronized notebook execution passed with production disabled.
+- A synthetic 100,000-pair library with 100,000 distinct R1 sequences completed counting despite both downstream guards being set to 1. Its SQLite file was approximately 12 MiB. A second invocation reused the completed sample. These short, synthetic, uncompressed inputs do not predict full-server throughput. The macOS external resource wrapper could not obtain all system metrics in the sandbox; no peak-RAM claim is made.
+- A fixture constructed from existing report sequences (112 pairs, artificial mates/qualities) produced identical cached-versus-legacy features, matrices, endpoint profiles, parent landscapes, and support reports. Its completed main JSON then successfully ran the RBC extension and loaded across the dashboard's seven pages. This is software validation, not a new biological analysis of the original paired libraries.
+- A uniform sample of 100 distinct eligible fixture queries was aligned against the complete 576,495-record combined reference. Index construction plus alignment took 227.34 seconds locally; 82 queries mapped, with 148 retained best hits, maximum 4 and p95 2 per query. These figures describe the fixture and this machine, not whole-library mapping rates or a production memory/time forecast. Indexes are rebuilt by each main-script capacity run.
+
+Next server action: complete `--count-cache ... --count-only`, then use the same cache for progressively larger `--alignment-capacity-queries` runs, with fresh output/log names and resource monitoring. Neither diagnostic JSON is a biological report. Full-library downstream capacity remains unverified; alignments, feature construction and final reporting are still memory-bound. See the current README for exact commands and recovery instructions.

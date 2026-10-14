@@ -12,7 +12,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from model import TRACKS, compact, comparison, composition, csv_bytes, feature_frame, load_path, provenance, validate, replicate_summary
+from model import TRACKS, compact, comparison, composition, csv_bytes, feature_frame, load_path, provenance, validate, replicate_summary, sample_qc, support_tiers
 
 st.set_page_config(page_title='csRNA pipeline data', page_icon='🧬', layout='wide')
 COLORS = {'rRNA': '#487C97', 'lncRNA': '#C07842', 'mRNA': '#749C6A', 'snoRNA': '#9B78B0',
@@ -66,7 +66,11 @@ args = argparse.ArgumentParser(add_help=False)
 args.add_argument('--report', default=os.environ.get('CSRNA_REPORT', ''))
 opts, _ = args.parse_known_args()
 st.sidebar.markdown('## csRNA pipeline data')
-page = st.sidebar.radio('Explore', ['Overview', 'RNA composition', 'Replicate QC', 'Feature comparisons', 'Parent explorer', 'Feature library'])
+page = st.sidebar.radio('Explore', ['Overview', 'RNA composition', 'Replicate QC', 'Feature comparisons', 'Parent explorer', 'Feature library', 'RBC diagnostics'])
+if page == 'RBC diagnostics':
+    from rbc_view import render
+    render()
+    st.stop()
 track = st.sidebar.selectbox('Evidence track', TRACKS, index=2,
                             help='Inclusive = exact + accepted-inexact support. No track proves modification.')
 with st.sidebar.expander('Open a pipeline report', expanded=not bool(opts.report)):
@@ -94,6 +98,7 @@ samples = list(report['samples'])
 subset = report['parameters']['input_scope'] == 'selected_subset'
 st.title(page)
 st.caption(provenance(report, track))
+st.caption('Endpoint clusters describe sequenced reads. Library fragmentation and cDNA synthesis can create boundaries; peaks and predicted folds do not establish native RNA species. Strand-specific preparation still requires verification of read-to-RNA orientation.')
 if subset:
     st.warning('Selected subset · Charts describe supplied reads only. Biological fold-change rankings are disabled.')
 else:
@@ -117,7 +122,7 @@ with st.sidebar.expander('Report details'):
 if page == 'Overview':
     a, b, c = st.columns(3)
     a.metric('Supplied reads', f"{sum(s['total_input_reads'] for s in report['samples'].values()):,}")
-    b.metric('Shared observed features', f"{len(frame):,}")
+    b.metric('Features in combined catalogue', f"{len(frame):,}")
     c.metric('RNA classes with features', len(categories))
     st.write('Start with composition, compare supported features, then inspect their parent-RNA boundaries.')
     rows = []
@@ -208,11 +213,16 @@ elif page == 'RNA composition':
 
 elif page == 'Replicate QC':
     st.write('Compare individual libraries before interpreting group differences. No samples are pooled or automatically excluded.')
+    st.subheader('Sample review flags')
+    table(sample_qc(report), 'sample_review_flags', evidence='inclusive')
+    st.caption('Review thresholds: unmapped ≥80%, fewer than 50 eligible reads, or a within-condition mapping spread ≥50 percentage points. These are descriptive flags, not exclusion rules. Sparse pilot profiles can be unstable.')
+    resolution = st.selectbox('Profile resolution', ['Endpoint features', 'Parent RNA (eligible support)'])
+    st.caption('Parent profiles sum disjoint eligible endpoint features across reference orientations; unresolved parent assignments are excluded. These are not all mapped parent counts.')
     chosen_samples = st.multiselect('Samples to inspect', samples, default=samples)
     chosen_categories = st.multiselect('RNA classes for replicate QC', categories, default=categories)
-    metadata, correlations, scores, variance, recurrence = replicate_summary(report, track, chosen_samples, chosen_categories)
+    metadata, correlations, scores, variance, recurrence = replicate_summary(report, track, chosen_samples, chosen_categories, resolution='parents' if resolution.startswith('Parent') else 'features')
     table(metadata, 'sample_metadata')
-    st.caption('Replicate type, PCR cycles, and preparation fields are reported as supplied. Unknown fields are not inferred. PCR cycles do not supply a numerical correction.')
+    st.caption('Replicate type, PCR cycles, and preparation fields are reported as supplied. Unknown fields are not inferred. PCR cycles do not supply a numerical correction. Inspect pcr_cycles_document_reported and pcr_cycles_review_status alongside the earlier sample-specific record; older reports retain their original metadata.')
     if not chosen_samples:
         st.info('Select at least one sample.')
         st.stop()
@@ -226,8 +236,8 @@ elif page == 'Replicate QC':
     if correlations.notna().any().any():
         chart(go.Figure(go.Heatmap(z=correlations.values, x=correlations.columns, y=correlations.index,
                                   zmin=-1, zmax=1, colorscale='RdBu', colorbar_title='Pearson r')),
-              'Similarity of feature abundance profiles', 'replicate_correlation',
-              'Pearson correlation of log2(1 + RPM), using features detected in at least one selected sample. Constant profiles are blank; high correlation does not establish biological replication.')
+              'Similarity of ' + resolution.lower() + ' profiles', 'replicate_correlation',
+              'Pearson correlation of log2(1 + RPM), using features detected in at least one selected sample. Constant profiles are blank. Sparse detection affects correlation; independent biological replication is supplied metadata.')
         table(correlations.rename_axis('Sample').reset_index(), 'replicate_correlations')
     else:
         st.info('Correlation unavailable: too few features or constant sample profiles.')
@@ -242,12 +252,12 @@ elif page == 'Replicate QC':
     if not recurrence.empty:
         st.subheader('Features recurring within each group')
         table(recurrence.sort_values(['Condition', 'Samples detected', 'Mean sample RPM'], ascending=[True, False, False]), 'group_feature_recurrence')
-        st.caption('Detection means at least one eligible read. Recurrence is across library columns and does not prove independent biological or molecular support.')
+        st.caption('Detection means at least one eligible read. Recurrence counts library columns. Biological independence comes from the supplied metadata; read counts do not establish independent molecules.')
     st.subheader('Raw counts for downstream statistics')
     matrix = report['count_matrices'][track]
     counts = pd.DataFrame(matrix['data'], index=matrix['feature_ids'], columns=matrix['sample_ids'])
     st.download_button('Download raw count matrix · CSV', csv_bytes(counts[chosen_samples].rename_axis('feature_id').reset_index()), f'{track}_raw_counts.csv', 'text/csv')
-    st.caption('All shared features are exported as raw integer counts in selected-sample order; no RPM or pseudocounts. Match metadata by sample_id. Statistical design and biological replication still need confirmation.')
+    st.caption('All shared features are exported as raw integer counts in selected-sample order; no RPM or pseudocounts. Match metadata by sample_id. Use the supplied replicate metadata and an appropriate statistical design. Pilot counts are diagnostic subsets, not full-library counts.')
     if report.get('paired_input_qc'):
         table(pd.DataFrame([{'Sample': s, **v} for s, v in report['paired_input_qc'].items()]), 'paired_input_qc')
 
@@ -353,6 +363,11 @@ elif page == 'Feature library':
         mask = df[['Feature', 'Parent RNA', 'Category']].astype(str).apply(lambda col: col.str.contains(query, case=False, regex=False)).any(axis=1)
         df = df[mask]
     st.caption(f'{len(df):,} matching features · support is read abundance, not independent molecules.')
+    tiers=support_tiers(report,track)
+    tiers=tiers[tiers.Feature.isin(df.Feature)]
+    st.subheader('Observed support tiers')
+    table(tiers, 'feature_support_tiers')
+    st.caption('A catalogue feature is not automatically shared or reproducible. Multiple-library detection can include different conditions; inspect within-condition recurrence in Replicate QC.')
     table(df, 'feature_library')
     if not df.empty:
         selected = st.selectbox('Inspect a feature', df['Feature'].tolist())
