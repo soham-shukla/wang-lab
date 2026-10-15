@@ -71,7 +71,7 @@ Validation on 2026-10-04: 11 automated tests passed; all five views passed with 
 
 ## Replicate batch support (2026-10-07)
 
-Schema 2.1 exploratory reports and paired-manifest R1 reports are supported alongside legacy reports. R1-only and no-control policies are displayed explicitly. See [pipeline run instructions](../README.md#replicate-libraries-and-paired-file-input--2026-10-07) and the [15-library manifest](../samples_recent_batch.csv).
+Schema 2.1 exploratory reports and paired-manifest R1 reports are supported alongside legacy reports. R1-only and no-control policies are displayed explicitly. See [pipeline run instructions](../../README.md#2-run-the-pipeline) and the [15-library manifest](../samples_recent_batch.csv).
 
 Replicate QC preserves individual library columns. It provides condition-faceted composition, Pearson correlations and PCA on log2(1 + RPM) shared-feature profiles, recurrence tables, preparation metadata, paired-input audit, and integer raw-count export. Constant correlations are blank and identical profiles have no PCA; zero selections are handled explicitly. The RNA-class filter affects feature QC, not whole-read composition or the raw-count export. Unknown biological/technical status is never inferred. Neither PCR cycle correction nor inferential statistics is performed.
 
